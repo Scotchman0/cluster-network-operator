@@ -20,8 +20,6 @@ spec:
     metadata:
       annotations:
         target.workload.openshift.io/management: '{"effect": "PreferredDuringScheduling"}'
-        # prevent blocks when node critical pods get evicted prior to workloads
-        cluster-autoscaler.kubernetes.io/enable-ds-eviction: "false"
       labels:
         app: ovn-ipsec
         component: network
@@ -93,6 +91,11 @@ spec:
           export KUBECONFIG=/var/run/ovnkube-kubeconfig
 {{ end }}
 
+          if ! rpm --dbpath=/usr/share/rpm -q libreswan; then
+            echo "host doesnt have libreswan, therefore ipsec will be configured by ipsec-pre414 daemonset, this ovn ipsec container has nothing to init"
+            exit 0
+          fi
+
           # Every time we restart this container, we will create a new key pair if
           # we are close to key expiration or if we do not already have a signed key pair.
           #
@@ -146,7 +149,7 @@ spec:
           EOF
             # Wait until the certificate signing request has been signed.
             counter=0
-            until [ -n "$(kubectl get csr -lk8s.ovn.org/ipsec-csr="$(hostname)" --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].status.certificate}' 2>/dev/null)" ]
+            until [ -n $(kubectl get csr -lk8s.ovn.org/ipsec-csr=$(hostname) --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].status.certificate}' 2>/dev/null) ]
             do
               counter=$((counter+1))
               sleep 1
@@ -158,7 +161,7 @@ spec:
             done
 
             # Decode the signed certificate.
-            kubectl get csr -lk8s.ovn.org/ipsec-csr="$(hostname)" --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].status.certificate}' | base64 -d | openssl x509 -outform pem -text -out $cert_pem
+            kubectl get csr -lk8s.ovn.org/ipsec-csr=$(hostname) --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].status.certificate}' | base64 -d | openssl x509 -outform pem -text -out $cert_pem
 
             # kubectl delete csr/$(hostname)
 
@@ -194,6 +197,9 @@ spec:
           name: etc-openvswitch
         - mountPath: /etc
           name: host-etc
+        - mountPath: /usr/share/rpm
+          name: host-usr-share-rpm
+          readOnly: true
         resources:
           requests:
             cpu: 10m
@@ -210,6 +216,11 @@ spec:
           #!/bin/bash
           set -exuo pipefail
 
+
+          if ! rpm --dbpath=/usr/share/rpm -q libreswan; then
+            echo "host doesnt have libreswan, therefore ipsec will be configured by ipsec-pre414 daemonset, this ovn ipsec container will sleep to infinity"
+            sleep infinity
+          fi
 
           # Don't start IPsec until ovnkube-node has finished setting up the node
           counter=0
@@ -238,6 +249,7 @@ spec:
 
           # Use /etc/ipsec.d/cno.conf file to write our own default IPsec connection parameters.
           # The /etc/ipsec.d/openshift.conf file can not be used because it is managed by openvswitch.
+          mkdir -p /etc/ipsec.d
           touch /etc/ipsec.d/cno.conf
           if ! grep -q "narrowing=yes" /etc/ipsec.d/cno.conf; then
           cat <<EOF > /etc/ipsec.d/cno.conf
@@ -268,7 +280,8 @@ spec:
           # We are running this in the foreground so that the container will be restarted when ovs-monitor-ipsec fails.
           /usr/libexec/platform-python /usr/share/openvswitch/scripts/ovs-monitor-ipsec \
             --pidfile=/var/run/openvswitch/ovs-monitor-ipsec.pid --ike-daemon=libreswan --no-restart-ike-daemon \
-            --ipsec-conf /etc/ipsec.d/openshift.conf --ipsec-d /var/lib/ipsec/nss \
+            --ipsec-conf /etc/ipsec.d/openshift.conf \
+            --ipsec-d /var/lib/ipsec/nss \
             --log-file --monitor unix:/var/run/openvswitch/db.sock
         lifecycle:
            preStop:
@@ -282,8 +295,13 @@ spec:
                    # In order to maintain traffic flows during container restart, we
                    # need to ensure that xfrm state and policies are not flushed.
 
+                   if ! rpm --dbpath=/usr/share/rpm -q libreswan; then
+                     echo "host doesnt have libreswan, therefore ipsec will be configured by ipsec-pre414 daemonset, preStop wont do anything"
+                     exit 0
+                   fi
+
                    # Don't allow ovs monitor to cleanup persistent state
-                   kill "$(cat /var/run/openvswitch/ovs-monitor-ipsec.pid 2>/dev/null)" 2>/dev/null || true
+                   kill $(cat /var/run/openvswitch/ovs-monitor-ipsec.pid 2>/dev/null) 2>/dev/null || true
         env:
         - name: K8S_NODE
           valueFrom:
@@ -305,6 +323,9 @@ spec:
           name: host-var-lib
         - mountPath: /etc
           name: host-etc
+        - mountPath: /usr/share/rpm
+          name: host-usr-share-rpm
+          readOnly: true
         resources:
           requests:
             cpu: 10m
@@ -317,6 +338,11 @@ spec:
             - -c
             - |
               #!/bin/bash
+              if ! rpm --dbpath=/usr/share/rpm -q libreswan; then
+                echo "host doesnt have libreswan, therefore ipsec will be configured by ipsec-pre414 daemonset, this ovn ipsec container is always \"alive\""
+                exit 0
+              fi
+
               if [[ $(ipsec whack --trafficstatus | wc -l) -eq 0 ]]; then
                 echo "no ipsec traffic configured"
                 exit 10
@@ -324,7 +350,7 @@ spec:
           initialDelaySeconds: 15
           periodSeconds: 60
       nodeSelector:
-        kubernetes.io/os: "linux"
+        beta.kubernetes.io/os: "linux"
       terminationGracePeriodSeconds: 10
       volumes:
 {{ if .NETWORK_NODE_IDENTITY_ENABLE }}
@@ -345,7 +371,8 @@ spec:
           type: DirectoryOrCreate
         name: etc-openvswitch
       - hostPath:
-          path: "{{.CNIConfDir}}"
+          path: /var/run/multus/cni/net.d
+          type: ""
         name: host-cni-netd
       - hostPath:
           path: /var/run
@@ -359,6 +386,10 @@ spec:
           path: /etc
           type: Directory
         name: host-etc
+      - name: host-usr-share-rpm
+        hostPath:
+          path: /usr/share/rpm
+          type: DirectoryOrCreate
       tolerations:
       - operator: "Exists"
 {{end}}
